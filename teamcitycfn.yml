@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template creates teamcity infrastructure
+Parameters:
+  userData:
+    Type: String
+    Default: |
+      #!/bin/bash
+      yum update -y
+      yum install -y nfs-utils
+      sed -i 's/search us-west-2.compute.internal/search us-west-2.compute.internal'"\n"'nameserver xx.xx.xx.xx/g' /etc/resolv.conf
+      # get instance id
+      instance_id=`curl http://xx.xx.xx.xx/latest/meta-data/instance-id`
+      # get tags on that instance
+      Product=`aws ec2 describe-tags --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=product" --region us-west-2 | grep Value | awk '{print $2}' | tr -d "\""| tr -d ","`
+      Tier=`aws ec2 describe-tags --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=tier" --region us-west-2 | grep Value | awk '{print $2}' | tr -d "\""| tr -d ","`
+      Team=`aws ec2 describe-tags --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=team" --region us-west-2 | grep Value | awk '{print $2}' | tr -d "\""| tr -d ","`
+      AwsRegion=`curl -s http://xxxx/latest/dynamic/instance-identity/document | grep -oP '\"availabilityZone\"[[:space:]]*:[[:space:]]*\"\K[^\"]+' |tr -d "-"`
+      #Hostname change for appdynamics
+      NewHostName="${Product}-${Tier}-${AwsRegion}"
+      echo ${NewHostName} > /etc/hostname
+      echo "127.0.0.1   ${NewHostName}" >> /etc/hosts
+      hostname ${NewHostName}
+      echo "preserve_hostname: true" >> /etc/cloud/cloud.cfg
+      # Mount EFS files system specific to Tier
+      if  [[ $Tier == 'test' ]]; then
+       mkdir /teamcity-${Tier}
+       mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 fs-28da0681.efs.us-west-2.amazonaws.com:/ /teamcity-${Tier}
+       sleep 30
+       sed -i 's/tcdb.c3nuhnzjo3m4.us-west-2.rds.amazonaws.com/tcdb-'"${Tier}"'.c3nuhnzjo3m4.us-west-2.rds.amazonaws.com/g'  /teamcity-${Tier}/teamcity/data/config/database.properties
+      elif [[ $Tier == 'prod' ]]; then
+       mkdir /teamcity-${Tier}
+       mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 fs-ca578b63.efs.us-west-2.amazonaws.com:/ /teamcity-${Tier}
+       sleep 30
+       sed -i 's/tcdb.c3nuhnzjo3m4.us-west-2.rds.amazonaws.com/tcdb-'"${Tier}"'.c3nuhnzjo3m4.us-west-2.rds.amazonaws.com/g'  /teamcity-${Tier}/data/config/database.properties
+      fi
+      #Memory change in teamcity-server.sh file to overcome meory issue
+      sed -i 's/-Xms2048m -Xmx2048m -XX:MaxPermSize=270m/-Xmx4g -XX:ReservedCodeCacheSize=350m/g'  /opt/TeamCity/bin/teamcity-server.sh
+      #Teamcity app dynamics deployment
+      rm -rf SecDevOps.Ansible
+      git clone -b develop git@github.com-user:providenceinnovation/SecDevOps.Ansible.git
+      if [[ $? == 0 ]]; then
+        #Run ansible-palybook
+        echo "Running Ansible playbook"
+        sed -i 's/hosts: all/hosts: localhost/g' SecDevOps.Ansible/playbooks/appd-config.yml
+        cd SecDevOps.Ansible
+        ansible-playbook playbooks/appd-config.yml  -i localhost --extra-vars "application=${Product}  tier=${Tier} team=${Product}"
+        if [[ $? == 0 ]]; then
+          echo "Playbook run is successful"
+        else
+          echo "Ansible plybook run is unsuccessful"
+        fi
+      else
+        echo "Failed to clone git repo"
+        `aws sns publish --topic-arn "arn:aws:sns:us-west-2:436236651811:userData_failure" --message " Test: Teamcity userdata failed to clone git repo on  ${instance_id}. Appdynamics was not configured correctly." --region us-west-2`
+      fi
+  prodcertID:
+    Type: String
+    Default: 'arn:aws:acm:us-west-2:436236651811:certificate/27f59414-9789-4372-b428-d93307e7637a'
+    Description: cert you want applied to the elb
+  testcertID:
+    Type: String
+    Default: 'arn:aws:acm:us-west-2:436236651811:certificate/8591f761-2c16-4519-b4f8-ad484650aefa'
+    Description: cert you want applied to the elb
+  tier:
+    Type: String
+    Description: Environment we are deploying to
+  exttoolsSubnet:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Default: 'subnet-2313c954,subnet-b963e7dc'
+    Description: The list of Subnetlds in your Virtual Private Cloud (VPC)
+    ConstraintDescription: must be a list of an existing subnets in the selected VPC
+  elbsubnet:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Default: 'subnet-4c13c93b,subnet-a063e7c5'
+    Description: The list of Subnetlds in your Virtual Private Cloud (VPC)
+    ConstraintDescription: must be a list of an existing subnets in the selected VPC for ELB
+  instanceType:
+    Type: String
+    Default: m4.large
+    AllowedValues:
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+    Description: 'Enter m4.large'
+  teamcityrole:
+    Type: String
+    Default: 'Teamcity-appdynamics-ASG-role'
+    Description: Role applies for ec2 which helps to run userdata
+  instanceCount:
+    Description: Number of instances to spin up
+    Type: Number
+    Default: '1'
+  digAMI:
+    Description: DIG Server hardened image ID
+    Type: 'AWS::EC2::Image::Id'
+    Default: xxxx
+  keyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Default: Shared Services
+    Description: >-
+      Existing key pair name that is used to connect ec2 instance. Make sure
+      that specified key pair exists in current region.
+Conditions:
+  AddProdCert: !Equals [ !Ref tier, prod ]
+  CreateProdRoute53: !Equals [ !Ref tier, prod ]
+Resources:
+  teamcityAutoScaleGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      VPCZoneIdentifier: !Ref exttoolsSubnet
+      LaunchConfigurationName: !Ref LaunchConfig
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: !Ref instanceCount
+      LoadBalancerNames:
+        - !Ref TEAMCITYELB
+      Tags:
+        - Key: product
+          Value: Teamcity
+          PropagateAtLaunch: true
+        - Key: tier
+          Value: !Ref tier
+          PropagateAtLaunch: true
+        - Key: Name
+          Value:
+            Fn::Join: [ "", ["Teamcity-",!Ref tier]]
+          PropagateAtLaunch: true
+        - Key: team
+          Value: Infra
+          PropagateAtLaunch: true
+        - Key: State
+          Value: AlwaysOn
+          PropagateAtLaunch: true
+  LaunchConfig:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Properties:
+      AssociatePublicIpAddress: 'false'
+      IamInstanceProfile: !Ref teamcityrole
+      ImageId: !Ref digAMI
+      InstanceType: !Ref instanceType
+      KeyName: !Ref keyName
+      SecurityGroups:
+        - sg-ea45a993 #SS TeamCity Master Server
+        - sg-f595708f #SS NFS SG
+        - sg-51dde834 #SS Web-Email Access
+        - sg-93eb2ff7 #SG.SS.OfficeIPs
+        - sg-14683971 #SS AD MGMT Access
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: "30"
+            VolumeType: "gp2"
+            DeleteOnTermination: "true"
+      UserData:
+        "Fn::Base64": !Ref userData
+  TEAMCITYELB:
+    Type: 'AWS::ElasticLoadBalancing::LoadBalancer'
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref elbsubnet
+      CrossZone: 'True'
+      SecurityGroups:
+        - sg-93eb2ff7 #SG.SS.OfficeIPs
+        - sg-f4729e8d #SS.TeamCity.LoadBalancer.External
+      Listeners:
+        - LoadBalancerPort: '443'
+          InstancePort: '8111'
+          Protocol: HTTPS
+          InstanceProtocol: HTTP
+          SSLCertificateId:
+            !If [AddProdCert, !Ref prodcertID, !Ref testcertID]
+      HealthCheck:
+        Target: 'TCP:8111'
+        HealthyThreshold: '3'
+        UnhealthyThreshold: '5'
+        Interval: '10'
+        Timeout: '5'
+      Tags:
+        - Key: product
+          Value: Teamcity
+        - Key: tier
+          Value: !Ref tier
+        - Key: Name
+          Value:
+             Fn::Join: [ "", ["Teamcity-",!Ref tier]]
+        - Key: team
+          Value: Infra
+        - Key: State
+          Value: AlwaysOn
+  TEAMCITYRT53:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: xxxxx.
+      Name:
+        !If [xxxx.]
+      Type: A
+      AliasTarget:
+        HostedZoneId: Z1H1FL5HABSF5
+        DNSName: !GetAtt TEAMCITYELB.DNSName
+Outputs:
+  Route53DNSstring:
+    Description: Route 53 DNS string to check web access
+    Value:
+      !If [CreateProdRoute53, xxx., xxx.com.]
